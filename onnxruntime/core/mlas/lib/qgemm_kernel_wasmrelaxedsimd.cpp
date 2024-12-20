@@ -17,8 +17,8 @@ Abstract:
 #include "mlasi.h"
 #include "qgemm.h"
 
-bool HasUSDot() {
-// Check out-of-bounds behaviour of Relaxed Integer Dot Product with Accumulation with signed and unsigned input (e.g. vpdpbusd).
+bool HasSDot() {
+      // Check out-of-bounds behaviour of Relaxed Integer Dot Product with Accumulation.
       const v128_t int8_input = wasm_i8x16_const(0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0);
       const volatile v128_t xint8_input = wasm_i8x16_const(0, 0, 0, -128, 0, 0, -128, 0, 0, -128, 0, 0, -128, 0, 0, 0);  // volatile to confuse Clang which otherwise ICE's
       const v128_t xint8_output = wasm_i32x4_relaxed_dot_i8x16_i7x16_add(int8_input, xint8_input, wasm_i8x16_const_splat(0));
@@ -26,9 +26,10 @@ bool HasUSDot() {
       const volatile v128_t overflow_input = wasm_i8x16_const(-128, -128, -128, -128, -128, -128, -1, -1, -1, -1, -128, -128, -1, -1, -1, -1);  // volatile to confuse Clang which otherwise ICE's
       const v128_t overflow_output = wasm_i32x4_relaxed_dot_i8x16_i7x16_add(wasm_i8x16_const_splat(-128), overflow_input, wasm_i8x16_const_splat(0));
       return !wasm_v128_any_true(wasm_v128_or(
-        wasm_v128_xor(xint8_output, wasm_i32x4_const_splat(128)),
-        wasm_v128_xor(overflow_output, wasm_i32x4_const(-65536, -98048, -98048, -130560))));
+        wasm_v128_xor(xint8_output, wasm_i32x4_const_splat(-128)),
+        wasm_v128_xor(overflow_output, wasm_i32x4_const(65536, 33024, 33024, 512))));
 }
+
 
 // wasm implementation of "_mm_unpacklo_epi8"
 v128_t __attribute__((__always_inline__, __nodebug__)) wasm_i8x16_unpacklo_relaxed(v128_t a, v128_t b) {
@@ -50,11 +51,11 @@ v128_t __attribute__((__always_inline__, __nodebug__)) wasm_i16x8_unpackhi_relax
     return wasm_i8x16_shuffle(a, b, 8, 9, 24, 25, 10, 11, 26, 27, 12, 13, 28, 29, 14, 15, 30, 31);
 }
 
-struct MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD
+struct MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD
 {
     typedef uint8_t PackedAType;
     typedef uint8_t PackedBType;
-    typedef uint8_t OffsetAType;
+    typedef int8_t OffsetAType;
     typedef int8_t OffsetBType;
 
     static constexpr size_t PackedK = 4;
@@ -62,28 +63,27 @@ struct MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD
     static constexpr MLAS_GEMM_QUANT_STRIDES PackedStrides{0, 0, 0};
 };
 
-constexpr size_t MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedK;
-constexpr MLAS_GEMM_QUANT_STRIDES MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::Strides;
+constexpr size_t MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedK;
+constexpr MLAS_GEMM_QUANT_STRIDES MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::Strides;
 
 template<>
 MLAS_FORCEINLINE
 int32_t
-MlasGemmQuantFixupZeroPointB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
-    int32_t ZeroPointB,
-    bool BIsSigned
+MlasGemmQuantFixupZeroPointA<MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD>(
+    int32_t ZeroPointA,
+    bool AIsSigned
     )
 {
-    if (!BIsSigned) {
-        ZeroPointB = MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::OffsetBType(ZeroPointB ^ 0x80);
+    if (!AIsSigned) {
+        ZeroPointA = MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::OffsetAType(ZeroPointA ^ 0x80);
     }
-
-    return ZeroPointB;
+    return ZeroPointA;
 }
 
 template<>
 void
-MlasGemmQuantCopyPackA<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
-    MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedAType* D,
+MlasGemmQuantCopyPackA<MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD>(
+    MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedAType* D,
     const uint8_t* A,
     size_t lda,
     size_t CountM,
@@ -92,10 +92,11 @@ MlasGemmQuantCopyPackA<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
     bool AIsSigned
     )
 {
-    MLAS_UNREFERENCED_PARAMETER(AIsSigned);
+    const v128_t BitFlipVector = wasm_i32x4_splat(AIsSigned ? 0 : 0x80808080);
     const v128_t ZeroVector = wasm_i64x2_const(0, 0);
     const v128_t OnesWordBroadcast = wasm_i16x8_splat(1);
-    uint8_t PaddedMatrixAData[8] = { 0 };
+    uint8_t PaddedMatrixAData[8];
+    wasm_v128_store64_lane(PaddedMatrixAData, BitFlipVector, 0);
 
     //
     // Process a single row of matrix A in a loop.
@@ -114,7 +115,7 @@ MlasGemmQuantCopyPackA<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         // but CountK is aligned up to a multiple of 4 to maintain 32-bit
         // alignment. All extra bytes are zero-padded.
         //
-        // Zero extend the source bytes to 16-bits and accumulate
+        // Sign extend the source bytes to 16-bits and accumulate
         // into an intermediate per-row
         // accumulator. CountK cannot be greater than 128 to avoid overflowing
         // these signed 16-bit accumulators.
@@ -123,7 +124,9 @@ MlasGemmQuantCopyPackA<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         while (k >= 8) {
 
             v128_t Bytes = wasm_v128_load64_zero(&a[0]);
-            v128_t Words = wasm_i8x16_unpacklo_relaxed(Bytes, ZeroVector);
+            //TODO(jing): This xor can be avoid if we check AisSigned here.
+            Bytes = wasm_v128_xor(Bytes, BitFlipVector);
+            v128_t Words = wasm_i16x8_extend_low_i8x16(Bytes);
 
             ReductionVector = wasm_i16x8_add(ReductionVector, Words);
 
@@ -150,7 +153,8 @@ MlasGemmQuantCopyPackA<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
             } while (padded < padded_end);
 
             v128_t Bytes = wasm_v128_load64_zero(PaddedMatrixAData);
-            v128_t Words = wasm_i8x16_unpacklo_relaxed(Bytes, ZeroVector);
+            Bytes = wasm_v128_xor(Bytes, BitFlipVector);
+            v128_t Words = wasm_i16x8_extend_low_i8x16(Bytes);
 
             ReductionVector = wasm_i16x8_add(ReductionVector, Words);
 
@@ -186,22 +190,18 @@ MlasGemmQuantCopyPackA<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
 
 MLAS_FORCEINLINE
 void
-MlasGemmU8X8CopyPackBProcessWasmRelaxedSimd(
-    MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedBType* D,
+MlasGemmX8S8CopyPackBProcessWasmRelaxedSimd(
+    MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedBType* D,
     v128_t BytesRow0,
     v128_t BytesRow1,
     v128_t BytesRow2,
     v128_t BytesRow3,
-    v128_t BitFlipVector,
     v128_t OnesByteBroadcast,
     v128_t ColumnSums[2]
 )
 {
     v128_t PairsInterleaved0 = wasm_i8x16_unpacklo_relaxed(BytesRow0, BytesRow1);
     v128_t PairsInterleaved1 = wasm_i8x16_unpacklo_relaxed(BytesRow2, BytesRow3);
-
-    PairsInterleaved0 = wasm_v128_xor(PairsInterleaved0, BitFlipVector);
-    PairsInterleaved1 = wasm_v128_xor(PairsInterleaved1, BitFlipVector);
 
     v128_t QuadsInterleaved0 = wasm_i16x8_unpacklo_relaxed(PairsInterleaved0, PairsInterleaved1);
     v128_t QuadsInterleaved1 = wasm_i16x8_unpackhi_relaxed(PairsInterleaved0, PairsInterleaved1);
@@ -215,8 +215,8 @@ MlasGemmU8X8CopyPackBProcessWasmRelaxedSimd(
 
 template<>
 void
-MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
-    MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedBType* D,
+MlasGemmQuantCopyPackB<MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD>(
+    MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedBType* D,
     const uint8_t* B,
     size_t ldb,
     size_t CountN,
@@ -225,8 +225,9 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
     bool BIsSigned
     )
 {
+    MLAS_UNREFERENCED_PARAMETER(BIsSigned);
     const v128_t OnesByteBroadcast = wasm_i8x16_splat(1);
-    const v128_t BitFlipVector = wasm_i32x4_splat(BIsSigned ? 0 : 0x80808080);
+    const v128_t ZeroVector = wasm_i64x2_const(0, 0);
 
     //
     // Process 8 columns of matrix B in a loop.
@@ -245,14 +246,14 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         // Interleave rows of matrix B and write to the packed buffer.
         //
 
-        while (k >= MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedK) {
+        while (k >= MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedK) {
 
             v128_t BytesRow0 = wasm_v128_load64_zero(&b[0]);
             v128_t BytesRow1 = wasm_v128_load64_zero(&b[ldb]);
             v128_t BytesRow2 = wasm_v128_load64_zero(&b[ldb * 2]);
             v128_t BytesRow3 = wasm_v128_load64_zero(&b[ldb * 3]);
 
-            MlasGemmU8X8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, BitFlipVector, OnesByteBroadcast, ColumnSums);
+            MlasGemmX8S8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, OnesByteBroadcast, ColumnSums);
 
             b += ldb * 4;
             D += 32;
@@ -262,9 +263,9 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         if (k > 0) {
 
             v128_t BytesRow0 = wasm_v128_load64_zero(&b[0]);
-            v128_t BytesRow1 = BitFlipVector;
-            v128_t BytesRow2 = BitFlipVector;
-            v128_t BytesRow3 = BitFlipVector;
+            v128_t BytesRow1 = ZeroVector;
+            v128_t BytesRow2 = ZeroVector;
+            v128_t BytesRow3 = ZeroVector;
 
             if (k >= 2) {
                 BytesRow1 = wasm_v128_load64_zero(&b[ldb]);
@@ -274,7 +275,7 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
                 BytesRow2 = wasm_v128_load64_zero(&b[ldb * 2]);
             }
 
-            MlasGemmU8X8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, BitFlipVector, OnesByteBroadcast, ColumnSums);
+            MlasGemmX8S8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, OnesByteBroadcast, ColumnSums);
 
             D += 32;
         }
@@ -298,8 +299,8 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         v128_t ColumnSums[2];
         uint8_t PaddedMatrixBData[32];
 
-        wasm_v128_store(&PaddedMatrixBData[0], BitFlipVector);
-        wasm_v128_store(&PaddedMatrixBData[16], BitFlipVector);
+        wasm_v128_store(&PaddedMatrixBData[0], ZeroVector);
+        wasm_v128_store(&PaddedMatrixBData[16], ZeroVector);
 
         ColumnSums[0] = wasm_i64x2_const(0, 0);
         ColumnSums[1] = wasm_i64x2_const(0, 0);
@@ -309,7 +310,7 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         // buffer and write to the packed buffer.
         //
 
-        while (k >= MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedK) {
+        while (k >= MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedK) {
 
             const uint8_t* bcopy = b;
             uint8_t* padded = PaddedMatrixBData;
@@ -329,7 +330,7 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
             v128_t BytesRow2 = wasm_v128_load64_zero(&PaddedMatrixBData[16]);
             v128_t BytesRow3 = wasm_v128_load64_zero(&PaddedMatrixBData[24]);
 
-            MlasGemmU8X8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, BitFlipVector, OnesByteBroadcast, ColumnSums);
+            MlasGemmX8S8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, OnesByteBroadcast, ColumnSums);
 
             b += ldb * 4;
             D += 32;
@@ -342,8 +343,8 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
             uint8_t* padded = PaddedMatrixBData;
             uint8_t* padded_end = padded + CountN;
 
-            wasm_v128_store(&PaddedMatrixBData[0], BitFlipVector);
-            wasm_v128_store(&PaddedMatrixBData[16], BitFlipVector);
+            wasm_v128_store(&PaddedMatrixBData[0], ZeroVector);
+            wasm_v128_store(&PaddedMatrixBData[16], ZeroVector);
 
             if (k == 3) {
               do {
@@ -373,7 +374,7 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
             v128_t BytesRow2 = wasm_v128_load64_zero(&PaddedMatrixBData[16]);
             v128_t BytesRow3 = wasm_v128_load64_zero(&PaddedMatrixBData[24]);
 
-            MlasGemmU8X8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, BitFlipVector, OnesByteBroadcast, ColumnSums);
+            MlasGemmX8S8CopyPackBProcessWasmRelaxedSimd(D, BytesRow0, BytesRow1, BytesRow2, BytesRow3, OnesByteBroadcast, ColumnSums);
         }
 
         wasm_v128_store(&ColumnSumBuffer[0], ColumnSums[0]);
@@ -383,7 +384,7 @@ MlasGemmQuantCopyPackB<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
 
 MLAS_FORCEINLINE
 void
-MlasGemmU8X8MultiplyAccumulateRowWasmRelaxedSimd(
+MlasGemmX8S8MultiplyAccumulateRowWasmRelaxedSimd(
     v128_t ABroadcast,
     const uint8_t* B,
     v128_t Accumulators[2]
@@ -399,9 +400,9 @@ MlasGemmU8X8MultiplyAccumulateRowWasmRelaxedSimd(
 
 template<>
 size_t
-MlasGemmQuantKernel<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
-    const MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedAType* A,
-    const MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedBType* B,
+MlasGemmQuantKernel<MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD>(
+    const MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedAType* A,
+    const MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedBType* B,
     int32_t* C,
     size_t PackedCountK,
     size_t CountM,
@@ -451,8 +452,8 @@ MlasGemmQuantKernel<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         ColumnSumBuffer += 8;
 
         //
-        // Broadcast each pair of 16-bit values from the matrix A and multiply
-        // with the pair of 16-bit values from matrix B, and add the 32-bit
+        // Broadcast each quad of 8-bit values from the matrix A and multiply
+        // with the quad of 8-bit values from matrix B, and add the 32-bit
         // intermediate into the accumulator registers.
         //
 
@@ -465,16 +466,16 @@ MlasGemmQuantKernel<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
             v128_t ABroadcast;
 
             ABroadcast = wasm_i32x4_shuffle(AElements, wasm_i32x4_splat(0), 0, 0, 0, 0);
-            MlasGemmU8X8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[0], Accumulators);
+            MlasGemmX8S8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[0], Accumulators);
 
             ABroadcast = wasm_i32x4_shuffle(AElements, wasm_i32x4_splat(0), 1, 1, 1, 1);
-            MlasGemmU8X8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[32], Accumulators);
+            MlasGemmX8S8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[32], Accumulators);
 
             ABroadcast = wasm_i32x4_shuffle(AElements, wasm_i32x4_splat(0), 2, 2, 2, 2);
-            MlasGemmU8X8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[64], Accumulators);
+            MlasGemmX8S8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[64], Accumulators);
 
             ABroadcast = wasm_i32x4_shuffle(AElements, wasm_i32x4_splat(0), 3, 3, 3, 3);
-            MlasGemmU8X8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[96], Accumulators);
+            MlasGemmX8S8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[96], Accumulators);
 
             a += 4 * 4;
             B += 4 * 32;
@@ -484,7 +485,7 @@ MlasGemmQuantKernel<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
         while (k > 0) {
 
             v128_t ABroadcast = wasm_i32x4_splat(*((int32_t*)a));
-            MlasGemmU8X8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[0], Accumulators);
+            MlasGemmX8S8MultiplyAccumulateRowWasmRelaxedSimd(ABroadcast, &B[0], Accumulators);
 
             a += 4;
             B += 32;
@@ -558,11 +559,11 @@ MlasGemmQuantKernel<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>(
     return 1;
 }
 
-const MLAS_GEMM_QUANT_DISPATCH MlasGemmU8X8DispatchWasmRelaxedSimd = {
-    MlasGemmQuantOperation<MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD>,
+const MLAS_GEMM_QUANT_DISPATCH MlasGemmX8S8DispatchWasmRelaxedSimd = {
+    MlasGemmQuantOperation<MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD>,
     nullptr,
     nullptr,
-    MLAS_GEMM_U8X8_KERNEL_WASMRELAXEDSIMD::PackedK,
+    MLAS_GEMM_X8S8_KERNEL_WASMRELAXEDSIMD::PackedK,
     0,
     4 // multiple of kernel stride M
 };
