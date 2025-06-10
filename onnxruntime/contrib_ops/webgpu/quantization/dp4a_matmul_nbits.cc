@@ -469,10 +469,13 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
     uint32_t tile_size = 32;
 
     std::string architecture(context.AdapterInfo().architecture.data, context.AdapterInfo().architecture.length);
+    std::cout << "architecture " << architecture << std::endl;
     if (architecture == "gen-12lp") {
+      std::cout << "optimize for adl\n";
       tile_size_k_vec = 64;
       tile_size = 2;
     } else if (architecture == "xe-2lpg") {
+      std::cout << "optimize for lnl\n";
       tile_size_k_vec = 32;
       tile_size = 4;
     }
